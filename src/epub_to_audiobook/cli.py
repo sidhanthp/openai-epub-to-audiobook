@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -57,6 +58,14 @@ DEFAULT_MERGE_WORKERS = 4
 DEFAULT_TTS_WORKERS = 1
 DEFAULT_TTS_ATTEMPTS = 5
 DEFAULT_TTS_SHARD_RETRIES = 4
+DEFAULT_TTS_BACKEND = "batch"
+DEFAULT_BATCH_POLL_INTERVAL_S = 60
+BATCH_ENDPOINT = "/v1/chat/completions"
+BATCH_STATE_FILENAME = "tts_batch_state.json"
+BATCH_REQUESTS_FILENAME = "tts_batch_requests.jsonl"
+BATCH_OUTPUT_FILENAME = "tts_batch_output.jsonl"
+BATCH_ERRORS_FILENAME = "tts_batch_errors.jsonl"
+BATCH_MAP_FILENAME = "tts_batch_map.json"
 
 
 @dataclass
@@ -91,6 +100,15 @@ class PreparedChapter:
     parts_dir: Path
     concat_path: Path
     chapter_output: Path
+
+
+@dataclass
+class BatchArtifacts:
+    state_path: Path
+    requests_path: Path
+    output_path: Path
+    errors_path: Path
+    map_path: Path
 
 
 class BlockTextExtractor(HTMLParser):
@@ -148,8 +166,8 @@ def parse_args() -> argparse.Namespace:
         default=".env",
         help="Env file containing OPENAI_API_KEY (default: .env)",
     )
-    parser.add_argument("--voice", default=DEFAULT_TTS_VOICE, help="Built-in OpenAI TTS voice")
-    parser.add_argument("--speed", type=float, default=1.0, help="TTS playback speed")
+    parser.add_argument("--voice", help=f"Built-in OpenAI TTS voice (default: {DEFAULT_TTS_VOICE})")
+    parser.add_argument("--speed", type=float, help="TTS playback speed")
     parser.add_argument(
         "--clean-model",
         default=DEFAULT_CLEAN_MODEL,
@@ -163,12 +181,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tts-model",
-        default=DEFAULT_TTS_MODEL,
         help=f"TTS model (default: {DEFAULT_TTS_MODEL})",
     )
     parser.add_argument(
         "--audio-format",
-        default=DEFAULT_AUDIO_FORMAT,
         choices=["mp3", "flac", "wav"],
         help=f"Output format for rendered chunk and final audio files (default: {DEFAULT_AUDIO_FORMAT})",
     )
@@ -182,7 +198,7 @@ def parse_args() -> argparse.Namespace:
         "--rpm",
         type=int,
         default=50,
-        help="Requests per minute cap for TTS batch generation",
+        help="Requests per minute cap for live TTS generation",
     )
     parser.add_argument(
         "--instructions",
@@ -253,7 +269,7 @@ def parse_args() -> argparse.Namespace:
         "--tts-workers",
         type=int,
         default=DEFAULT_TTS_WORKERS,
-        help=f"Parallel workers for TTS shard generation (default: {DEFAULT_TTS_WORKERS})",
+        help=f"Parallel workers for live TTS shard generation (default: {DEFAULT_TTS_WORKERS})",
     )
     parser.add_argument(
         "--tts-attempts",
@@ -265,9 +281,57 @@ def parse_args() -> argparse.Namespace:
         "--tts-shard-retries",
         type=int,
         default=DEFAULT_TTS_SHARD_RETRIES,
-        help=f"Outer retry count for each TTS shard with random exponential backoff (default: {DEFAULT_TTS_SHARD_RETRIES})",
+        help=f"Outer retry count for each live TTS shard with random exponential backoff (default: {DEFAULT_TTS_SHARD_RETRIES})",
+    )
+    parser.add_argument(
+        "--tts-backend",
+        choices=["live", "batch"],
+        help="Advanced override for TTS transport. Default is batch; use --rush for the normal fast-path override.",
+    )
+    parser.add_argument(
+        "--rush",
+        action="store_true",
+        help="Use live TTS instead of the cheaper default batch path.",
+    )
+    parser.add_argument(
+        "--wait",
+        "--wait-for-batch",
+        dest="wait_for_batch",
+        action="store_true",
+        help="When using batch TTS, poll until the batch completes, materialize outputs, and merge the audiobook.",
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=int,
+        default=DEFAULT_BATCH_POLL_INTERVAL_S,
+        help=f"Polling interval in seconds for batch status checks (default: {DEFAULT_BATCH_POLL_INTERVAL_S})",
     )
     return parser.parse_args()
+
+
+def resolve_tts_backend(tts_backend: str | None, rush: bool) -> str:
+    if rush:
+        if tts_backend == "batch":
+            raise SystemExit("--rush cannot be combined with --tts-backend batch.")
+        return "live"
+    if tts_backend:
+        return tts_backend
+    return DEFAULT_TTS_BACKEND
+
+
+def resolve_runtime_settings(
+    args: argparse.Namespace,
+    render_metadata: dict[str, object] | None = None,
+) -> tuple[str, float, str, str, str]:
+    render_metadata = render_metadata or {}
+    audio_format = str(
+        args.audio_format or render_metadata.get("audio_format") or DEFAULT_AUDIO_FORMAT
+    )
+    speed = float(args.speed if args.speed is not None else render_metadata.get("speed", 1.0))
+    voice = str(args.voice or render_metadata.get("voice") or DEFAULT_TTS_VOICE)
+    tts_model = str(args.tts_model or render_metadata.get("tts_model") or DEFAULT_TTS_MODEL)
+    instructions = args.instructions or default_instructions(speed)
+    return audio_format, speed, voice, tts_model, instructions
 
 
 def slugify(value: str) -> str:
@@ -706,6 +770,388 @@ def build_audio_metadata(
     if track_number is not None and track_total:
         tags["track"] = f"{track_number}/{track_total}"
     return {key: value for key, value in tags.items() if value}
+
+
+def batch_artifacts(base_dir: Path) -> BatchArtifacts:
+    return BatchArtifacts(
+        state_path=base_dir / BATCH_STATE_FILENAME,
+        requests_path=base_dir / BATCH_REQUESTS_FILENAME,
+        output_path=base_dir / BATCH_OUTPUT_FILENAME,
+        errors_path=base_dir / BATCH_ERRORS_FILENAME,
+        map_path=base_dir / BATCH_MAP_FILENAME,
+    )
+
+
+def create_openai_client() -> OpenAI:
+    if OpenAI is None:
+        raise SystemExit("openai SDK not installed. Install it before running.")
+    return OpenAI()
+
+
+def read_jobs(path: Path) -> list[dict[str, object]]:
+    jobs: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if raw:
+            jobs.append(json.loads(raw))
+    return jobs
+
+
+def pending_jobs_for_render(
+    jobs_path: Path,
+    parts_dir: Path,
+    audio_format: str,
+    force: bool,
+) -> list[dict[str, object]]:
+    pending: list[dict[str, object]] = []
+    for idx, job in enumerate(read_jobs(jobs_path), start=1):
+        explicit_out = job.get("out")
+        if explicit_out:
+            out_path = parts_dir / Path(str(explicit_out))
+        else:
+            out_path = parts_dir / f"{idx:03d}.{audio_format}"
+        if force or not out_path.exists():
+            pending.append(job)
+    return pending
+
+
+def save_batch_state(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_batch_state(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def make_batch_requests(
+    *,
+    pending_jobs: list[dict[str, object]],
+    tts_model: str,
+    voice: str,
+    audio_format: str,
+    instructions: str,
+    requests_path: Path,
+    map_path: Path,
+) -> tuple[int, dict[str, str]]:
+    request_map: dict[str, str] = {}
+    with requests_path.open("w", encoding="utf-8") as batch_file:
+        for idx, job in enumerate(pending_jobs, start=1):
+            custom_id = f"tts-{idx:05d}"
+            relative_out = str(job["out"])
+            request_map[custom_id] = relative_out
+            body = {
+                "model": tts_model,
+                "modalities": ["audio"],
+                "audio": {"voice": voice, "format": audio_format},
+                "messages": [
+                    {"role": "developer", "content": instructions},
+                    {"role": "user", "content": str(job["input"])},
+                ],
+            }
+            batch_file.write(
+                json.dumps(
+                    {
+                        "custom_id": custom_id,
+                        "method": "POST",
+                        "url": BATCH_ENDPOINT,
+                        "body": body,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    map_path.write_text(json.dumps(request_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return len(request_map), request_map
+
+
+def batch_status_is_terminal(status: str) -> bool:
+    return status in {"completed", "failed", "expired", "cancelled"}
+
+
+def batch_status_is_active(status: str) -> bool:
+    return status in {"validating", "in_progress", "finalizing", "cancelling"}
+
+
+def describe_batch_request_counts(counts: object) -> str:
+    if counts is None:
+        return ""
+    if hasattr(counts, "model_dump"):
+        counts = counts.model_dump()
+    elif hasattr(counts, "__dict__"):
+        counts = vars(counts)
+    if not isinstance(counts, dict):
+        return ""
+    pieces: list[str] = []
+    for key in ("total", "completed", "failed"):
+        value = counts.get(key)
+        if value is not None:
+            pieces.append(f"{key}={value}")
+    return ", ".join(pieces)
+
+
+def read_sdk_binary_content(result: object) -> bytes:
+    if isinstance(result, bytes):
+        return result
+    if isinstance(result, bytearray):
+        return bytes(result)
+    if hasattr(result, "content"):
+        content = getattr(result, "content")
+        if isinstance(content, bytes):
+            return content
+        if isinstance(content, str):
+            return content.encode("utf-8")
+    if hasattr(result, "read"):
+        data = result.read()
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        return data
+    if hasattr(result, "text"):
+        text = getattr(result, "text")
+        if isinstance(text, str):
+            return text.encode("utf-8")
+    raise SystemExit("Unable to read file content from OpenAI SDK response.")
+
+
+def download_file_to_path(client: OpenAI, file_id: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    data = read_sdk_binary_content(client.files.content(file_id))
+    destination.write_bytes(data)
+    return destination
+
+
+def extract_audio_payload(response_body: dict[str, object]) -> str | None:
+    choices = response_body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message", {})
+    if not isinstance(message, dict):
+        return None
+    audio = message.get("audio")
+    if not isinstance(audio, dict):
+        return None
+    data = audio.get("data")
+    return data if isinstance(data, str) else None
+
+
+def materialize_batch_outputs(
+    *,
+    parts_dir: Path,
+    output_path: Path,
+    map_path: Path,
+    force: bool,
+) -> tuple[int, int]:
+    if not output_path.exists() or not map_path.exists():
+        return 0, 0
+    request_map = json.loads(map_path.read_text(encoding="utf-8"))
+    completed = 0
+    failed = 0
+    for line in output_path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        item = json.loads(raw)
+        custom_id = item.get("custom_id")
+        relative_out = request_map.get(custom_id)
+        if not relative_out:
+            continue
+        out_path = parts_dir / relative_out
+        error = item.get("error")
+        response = item.get("response")
+        if error or not isinstance(response, dict) or response.get("status_code") != 200:
+            failed += 1
+            continue
+        response_body = response.get("body", {})
+        if not isinstance(response_body, dict):
+            failed += 1
+            continue
+        audio_b64 = extract_audio_payload(response_body)
+        if not audio_b64:
+            failed += 1
+            continue
+        if out_path.exists() and not force:
+            completed += 1
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(base64.b64decode(audio_b64))
+        completed += 1
+    return completed, failed
+
+
+def submit_tts_batch(
+    *,
+    client: OpenAI,
+    base_dir: Path,
+    jobs_path: Path,
+    parts_dir: Path,
+    tts_model: str,
+    voice: str,
+    audio_format: str,
+    instructions: str,
+    force: bool,
+) -> dict[str, object]:
+    artifacts = batch_artifacts(base_dir)
+    pending_jobs = pending_jobs_for_render(jobs_path, parts_dir, audio_format, force)
+    if not pending_jobs:
+        return {"status": "nothing_to_submit", "pending_jobs": 0}
+    total, _request_map = make_batch_requests(
+        pending_jobs=pending_jobs,
+        tts_model=tts_model,
+        voice=voice,
+        audio_format=audio_format,
+        instructions=instructions,
+        requests_path=artifacts.requests_path,
+        map_path=artifacts.map_path,
+    )
+    with artifacts.requests_path.open("rb") as handle:
+        input_file = client.files.create(file=handle, purpose="batch")
+    batch = client.batches.create(
+        input_file_id=input_file.id,
+        endpoint=BATCH_ENDPOINT,
+        completion_window="24h",
+        metadata={"tool": "openai-epub-to-audiobook", "mode": "tts"},
+    )
+    state = {
+        "batch_id": batch.id,
+        "input_file_id": input_file.id,
+        "status": getattr(batch, "status", "validating"),
+        "endpoint": BATCH_ENDPOINT,
+        "jobs_path": jobs_path.as_posix(),
+        "parts_dir": parts_dir.as_posix(),
+        "tts_model": tts_model,
+        "voice": voice,
+        "audio_format": audio_format,
+        "submitted_request_count": total,
+    }
+    save_batch_state(artifacts.state_path, state)
+    return state
+
+
+def refresh_batch_state(client: OpenAI, state: dict[str, object], state_path: Path) -> dict[str, object]:
+    batch = client.batches.retrieve(str(state["batch_id"]))
+    updated = {
+        **state,
+        "status": getattr(batch, "status", state.get("status", "unknown")),
+        "output_file_id": getattr(batch, "output_file_id", None),
+        "error_file_id": getattr(batch, "error_file_id", None),
+        "request_counts": getattr(batch, "request_counts", None),
+    }
+    save_batch_state(state_path, updated)
+    return updated
+
+
+def finalize_batch_outputs(
+    *,
+    client: OpenAI,
+    base_dir: Path,
+    parts_dir: Path,
+    force: bool,
+) -> tuple[int, int]:
+    artifacts = batch_artifacts(base_dir)
+    state = load_batch_state(artifacts.state_path)
+    if not state:
+        return 0, 0
+    output_file_id = state.get("output_file_id")
+    error_file_id = state.get("error_file_id")
+    if output_file_id:
+        download_file_to_path(client, str(output_file_id), artifacts.output_path)
+    if error_file_id:
+        download_file_to_path(client, str(error_file_id), artifacts.errors_path)
+    return materialize_batch_outputs(
+        parts_dir=parts_dir,
+        output_path=artifacts.output_path,
+        map_path=artifacts.map_path,
+        force=force,
+    )
+
+
+def run_tts_batch_api(
+    *,
+    base_dir: Path,
+    jobs_path: Path,
+    parts_dir: Path,
+    manifest_path: Path,
+    metadata_path: Path,
+    book_concat_path: Path,
+    final_book_path: Path,
+    tts_model: str,
+    voice: str,
+    speed: float,
+    audio_format: str,
+    instructions: str,
+    wait_for_batch: bool,
+    batch_poll_interval: int,
+    merge_workers: int,
+    force: bool,
+) -> None:
+    client = create_openai_client()
+    artifacts = batch_artifacts(base_dir)
+
+    while True:
+        remaining_jobs = pending_jobs_for_render(jobs_path, parts_dir, audio_format, force)
+        if not remaining_jobs:
+            merge_all(
+                manifest_path=manifest_path,
+                metadata_path=metadata_path,
+                book_concat_path=book_concat_path,
+                final_book_path=final_book_path,
+                merge_workers=merge_workers,
+            )
+            return
+
+        state = load_batch_state(artifacts.state_path)
+        if state:
+            state = refresh_batch_state(client, state, artifacts.state_path)
+            status = str(state["status"])
+            counts = describe_batch_request_counts(state.get("request_counts"))
+            counts_suffix = f" ({counts})" if counts else ""
+            if batch_status_is_active(status):
+                print(f"Batch {state['batch_id']} status: {status}{counts_suffix}")
+                if not wait_for_batch:
+                    print(
+                        f"Re-run with --render-dir {base_dir} --wait to block until completion and finalize audio."
+                    )
+                    return
+                time.sleep(max(1, batch_poll_interval))
+                continue
+            if batch_status_is_terminal(status):
+                completed, failed = finalize_batch_outputs(
+                    client=client,
+                    base_dir=base_dir,
+                    parts_dir=parts_dir,
+                    force=force,
+                )
+                print(
+                    f"Batch {state['batch_id']} finalized with status {status}. "
+                    f"Materialized {completed} outputs; {failed} failed."
+                )
+                refreshed_remaining = pending_jobs_for_render(jobs_path, parts_dir, audio_format, force)
+                if not refreshed_remaining:
+                    continue
+                if not wait_for_batch and status == "completed":
+                    print(f"{len(refreshed_remaining)} outputs remain. Re-run to submit a follow-up batch.")
+                    return
+                artifacts.state_path.unlink(missing_ok=True)
+                continue
+
+        state = submit_tts_batch(
+            client=client,
+            base_dir=base_dir,
+            jobs_path=jobs_path,
+            parts_dir=parts_dir,
+            tts_model=tts_model,
+            voice=voice,
+            audio_format=audio_format,
+            instructions=instructions,
+            force=force,
+        )
+        if state.get("status") == "nothing_to_submit":
+            continue
+        print(f"Submitted batch {state['batch_id']} with {state['submitted_request_count']} requests.")
+        if not wait_for_batch:
+            print(f"Re-run with --render-dir {base_dir} --wait to block until completion and finalize audio.")
+            return
 
 
 def clean_chunk_codex(model: str, chapter_title: str, text: str, index: int, total: int, workdir: Path) -> str:
@@ -1313,6 +1759,9 @@ def merge_all(
 
 def main() -> int:
     args = parse_args()
+    tts_backend = resolve_tts_backend(args.tts_backend, args.rush)
+    if args.wait_for_batch and tts_backend != "batch":
+        raise SystemExit("--wait can only be used with batch TTS. Remove --rush or force --tts-backend batch.")
     render_dir = Path(args.render_dir).expanduser().resolve() if args.render_dir else None
     epub_path = Path(args.epub).expanduser().resolve() if args.epub else None
     if render_dir and epub_path:
@@ -1339,40 +1788,57 @@ def main() -> int:
                 f"Render dir must contain jobs.jsonl, manifest.json, and metadata.json: {render_dir}"
             )
         render_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        audio_format = args.audio_format or render_metadata.get("audio_format", DEFAULT_AUDIO_FORMAT)
-        speed = args.speed if args.speed != 1.0 else float(render_metadata.get("speed", 1.0))
-        voice = args.voice if args.voice != DEFAULT_TTS_VOICE else str(render_metadata.get("voice", DEFAULT_TTS_VOICE))
-        tts_model = args.tts_model if args.tts_model != DEFAULT_TTS_MODEL else str(
-            render_metadata.get("tts_model", DEFAULT_TTS_MODEL)
+        audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
+            args,
+            render_metadata=render_metadata,
         )
-        instructions = args.instructions or default_instructions(speed)
         final_name = render_metadata.get("book_slug", render_dir.name)
         selection_slug = render_metadata.get("selection_slug", "selection")
         if selection_slug != "full-book":
             final_name = f"{final_name}-{selection_slug}"
         final_book_path = render_dir / f"{final_name}.{audio_format}"
         load_api_key(secret_file)
-        run_tts_batch(
-            jobs_path=jobs_path,
-            out_dir=render_dir / "parts",
-            tts_model=tts_model,
-            voice=voice,
-            speed=speed,
-            audio_format=audio_format,
-            instructions=instructions,
-            rpm=args.rpm,
-            tts_workers=args.tts_workers,
-            tts_attempts=args.tts_attempts,
-            tts_shard_retries=args.tts_shard_retries,
-            force=args.force,
-        )
-        merge_all(
-            manifest_path=manifest_path,
-            metadata_path=metadata_path,
-            book_concat_path=book_concat_path,
-            final_book_path=final_book_path,
-            merge_workers=args.merge_workers,
-        )
+        if tts_backend == "batch":
+            run_tts_batch_api(
+                base_dir=render_dir,
+                jobs_path=jobs_path,
+                parts_dir=render_dir / "parts",
+                manifest_path=manifest_path,
+                metadata_path=metadata_path,
+                book_concat_path=book_concat_path,
+                final_book_path=final_book_path,
+                tts_model=tts_model,
+                voice=voice,
+                speed=speed,
+                audio_format=audio_format,
+                instructions=instructions,
+                wait_for_batch=args.wait_for_batch,
+                batch_poll_interval=args.batch_poll_interval,
+                merge_workers=args.merge_workers,
+                force=args.force,
+            )
+        else:
+            run_tts_batch(
+                jobs_path=jobs_path,
+                out_dir=render_dir / "parts",
+                tts_model=tts_model,
+                voice=voice,
+                speed=speed,
+                audio_format=audio_format,
+                instructions=instructions,
+                rpm=args.rpm,
+                tts_workers=args.tts_workers,
+                tts_attempts=args.tts_attempts,
+                tts_shard_retries=args.tts_shard_retries,
+                force=args.force,
+            )
+            merge_all(
+                manifest_path=manifest_path,
+                metadata_path=metadata_path,
+                book_concat_path=book_concat_path,
+                final_book_path=final_book_path,
+                merge_workers=args.merge_workers,
+            )
         return 0
 
     metadata, chapters, _raw_texts = parse_epub(epub_path, skip_titles)
@@ -1390,14 +1856,14 @@ def main() -> int:
     if needs_api_key:
         load_api_key(secret_file)
 
-    instructions = args.instructions or default_instructions(args.speed)
+    audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(args)
     prepared = prepare_outputs(
         epub_path=epub_path,
         out_root=out_root,
-        voice=args.voice,
-        speed=args.speed,
-        audio_format=args.audio_format,
-        tts_model=args.tts_model,
+        voice=voice,
+        speed=speed,
+        audio_format=audio_format,
+        tts_model=tts_model,
         clean_model=args.clean_model,
         instructions=instructions,
         max_chars=args.max_chars,
@@ -1414,27 +1880,47 @@ def main() -> int:
         return 0
 
     base_dir = Path(prepared["base_dir"])
-    run_tts_batch(
-        jobs_path=Path(prepared["jobs_path"]),
-        out_dir=base_dir / "parts",
-        tts_model=args.tts_model,
-        voice=args.voice,
-        speed=args.speed,
-        audio_format=args.audio_format,
-        instructions=instructions,
-        rpm=args.rpm,
-        tts_workers=args.tts_workers,
-        tts_attempts=args.tts_attempts,
-        tts_shard_retries=args.tts_shard_retries,
-        force=args.force,
-    )
-    merge_all(
-        manifest_path=Path(prepared["manifest_path"]),
-        metadata_path=Path(prepared["metadata_path"]),
-        book_concat_path=Path(prepared["book_concat_path"]),
-        final_book_path=Path(prepared["final_book_path"]),
-        merge_workers=args.merge_workers,
-    )
+    if tts_backend == "batch":
+        run_tts_batch_api(
+            base_dir=base_dir,
+            jobs_path=Path(prepared["jobs_path"]),
+            parts_dir=base_dir / "parts",
+            manifest_path=Path(prepared["manifest_path"]),
+            metadata_path=Path(prepared["metadata_path"]),
+            book_concat_path=Path(prepared["book_concat_path"]),
+            final_book_path=Path(prepared["final_book_path"]),
+            tts_model=tts_model,
+            voice=voice,
+            speed=speed,
+            audio_format=audio_format,
+            instructions=instructions,
+            wait_for_batch=args.wait_for_batch,
+            batch_poll_interval=args.batch_poll_interval,
+            merge_workers=args.merge_workers,
+            force=args.force,
+        )
+    else:
+        run_tts_batch(
+            jobs_path=Path(prepared["jobs_path"]),
+            out_dir=base_dir / "parts",
+            tts_model=tts_model,
+            voice=voice,
+            speed=speed,
+            audio_format=audio_format,
+            instructions=instructions,
+            rpm=args.rpm,
+            tts_workers=args.tts_workers,
+            tts_attempts=args.tts_attempts,
+            tts_shard_retries=args.tts_shard_retries,
+            force=args.force,
+        )
+        merge_all(
+            manifest_path=Path(prepared["manifest_path"]),
+            metadata_path=Path(prepared["metadata_path"]),
+            book_concat_path=Path(prepared["book_concat_path"]),
+            final_book_path=Path(prepared["final_book_path"]),
+            merge_workers=args.merge_workers,
+        )
     return 0
 
 

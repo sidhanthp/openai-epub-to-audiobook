@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openai-epub-to-audiobook"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turn EPUB files into audiobook files with OpenAI text cleanup and TTS."
 readme = "README.md"
 requires-python = ">=3.10"

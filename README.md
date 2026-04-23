@@ -4,7 +4,7 @@ Turn an `EPUB` into a single audiobook file with:
 
 - EPUB chapter parsing
 - optional text cleanup before speech
-- OpenAI TTS batch rendering
+- OpenAI TTS rendering with cheap-by-default batch mode
 - final merge with audiobook-friendly metadata and cover art
 
 This repo intentionally excludes any books, generated audio, or secrets.
@@ -33,7 +33,7 @@ pip install -e .
 cp .env.example .env
 ```
 
-Set `OPENAI_API_KEY` in your shell or `.env` file before live TTS runs.
+Set `OPENAI_API_KEY` in your shell or `.env` file before TTS runs.
 
 ## Quick Start
 
@@ -51,17 +51,28 @@ epub-to-audiobook /path/to/book.epub \
   --prepare-only
 ```
 
-Run a one-chapter sample:
+Run a one-chapter sample fast:
 
 ```bash
 epub-to-audiobook /path/to/book.epub \
   --chapter-number 5 \
+  --rush \
   --voice marin \
   --speed 1.5 \
   --audio-format mp3
 ```
 
-Run a full book:
+Submit a full book in default cheap batch mode:
+
+```bash
+epub-to-audiobook /path/to/book.epub \
+  --voice marin \
+  --speed 1.5 \
+  --audio-format mp3 \
+  --cleanup-workers 4
+```
+
+Submit a full book and wait for the batch to finish:
 
 ```bash
 epub-to-audiobook /path/to/book.epub \
@@ -69,18 +80,39 @@ epub-to-audiobook /path/to/book.epub \
   --speed 1.5 \
   --audio-format mp3 \
   --cleanup-workers 4 \
-  --tts-workers 2 \
-  --rpm 20
+  --wait
 ```
 
-Resume from a prepared render directory:
+Resume from a prepared render directory and wait for batch completion:
 
 ```bash
 epub-to-audiobook \
   --render-dir output/library/my-book/full-book \
+  --wait
+```
+
+Resume from a prepared render directory in fast live mode:
+
+```bash
+epub-to-audiobook \
+  --render-dir output/library/my-book/full-book \
+  --rush \
   --tts-workers 2 \
   --rpm 20
 ```
+
+## TTS Modes
+
+- Default: batch. Cheapest path for full-book final renders.
+- `--wait`: stay attached to the batch job, poll until it completes, materialize outputs, and merge the final audiobook.
+- `--rush`: switch to live TTS for faster interactive samples and retakes.
+- `--tts-backend`: advanced override if you want to force `live` or `batch` directly.
+
+Recommended workflow:
+
+- Samples and retakes: `--rush`
+- Full-book finals: default batch, usually with `--wait`
+- Long-running background jobs: submit in default batch mode, then later resume with `--render-dir ... --wait`
 
 ## Output Layout
 
@@ -110,6 +142,16 @@ Inside it:
 - `local`: skip model cleanup and use only deterministic local cleanup
 
 Codex cleanup is bounded with retries and a timeout. If it fails on a chunk, the script falls back to the locally cleaned text instead of aborting the whole run.
+
+## Batch Resume Behavior
+
+When you run in default batch mode without `--wait`, the tool:
+
+- prepares text and jobs
+- submits the batch
+- exits after printing the exact `--render-dir ... --wait` command shape to resume later
+
+If a batch is already active, rerunning with `--render-dir` prints the current batch status. Add `--wait` to keep polling until completion.
 
 ## Notes
 

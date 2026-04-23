@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+import zipfile
+from argparse import Namespace
+from pathlib import Path
+
+from epub_to_audiobook.cli import (
+    BATCH_ENDPOINT,
+    local_cleanup,
+    make_batch_requests,
+    materialize_batch_outputs,
+    prepare_outputs,
+    resolve_runtime_settings,
+    resolve_epub_paths,
+    resolve_tts_backend,
+)
+
+
+def build_test_epub(path: Path) -> None:
+    container_xml = """\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+      <rootfiles>
+        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+      </rootfiles>
+    </container>
+    """
+    content_opf = """\
+    <?xml version="1.0" encoding="utf-8"?>
+    <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
+      <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>Test Book</dc:title>
+        <dc:creator>Test Author</dc:creator>
+        <dc:language>en</dc:language>
+        <dc:identifier id="BookId">book-id</dc:identifier>
+      </metadata>
+      <manifest>
+        <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+        <item id="chap1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+        <item id="chap2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+      </manifest>
+      <spine toc="ncx">
+        <itemref idref="chap1"/>
+        <itemref idref="chap2"/>
+      </spine>
+    </package>
+    """
+    toc_ncx = """\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+      <navMap>
+        <navPoint id="navPoint-1" playOrder="1">
+          <navLabel><text>Chapter One</text></navLabel>
+          <content src="chapter1.xhtml"/>
+        </navPoint>
+        <navPoint id="navPoint-2" playOrder="2">
+          <navLabel><text>Chapter Two</text></navLabel>
+          <content src="chapter2.xhtml"/>
+        </navPoint>
+      </navMap>
+    </ncx>
+    """
+    chapter1 = """\
+    <html xmlns="http://www.w3.org/1999/xhtml"><body>
+      <h1>Chapter One</h1>
+      <p>First paragraph.</p>
+      <p>Second paragraph with Test Book in the middle.</p>
+    </body></html>
+    """
+    chapter2 = """\
+    <html xmlns="http://www.w3.org/1999/xhtml"><body>
+      <h1>Chapter Two</h1>
+      <p>Third paragraph.</p>
+    </body></html>
+    """
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("META-INF/container.xml", textwrap.dedent(container_xml))
+        zf.writestr("OEBPS/content.opf", textwrap.dedent(content_opf))
+        zf.writestr("OEBPS/toc.ncx", textwrap.dedent(toc_ncx))
+        zf.writestr("OEBPS/chapter1.xhtml", textwrap.dedent(chapter1))
+        zf.writestr("OEBPS/chapter2.xhtml", textwrap.dedent(chapter2))
+
+
+class CliTests(unittest.TestCase):
+    def test_resolve_epub_paths_uses_container_xml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            epub_path = Path(tmpdir) / "book.epub"
+            build_test_epub(epub_path)
+            with zipfile.ZipFile(epub_path) as zf:
+                self.assertEqual(resolve_epub_paths(zf), ("OEBPS/content.opf", "OEBPS"))
+
+    def test_local_cleanup_keeps_title_mentions_in_body(self) -> None:
+        cleaned = local_cleanup(
+            "Test Book",
+            "Chapter One",
+            "Test Book\n\nChapter One\n\nA paragraph that mentions Test Book in the body.",
+        )
+        self.assertIn("mentions Test Book in the body", cleaned)
+        self.assertTrue(cleaned.startswith("Chapter One\n\n"))
+
+    def test_prepare_outputs_isolates_full_and_selection_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            epub_path = tmp / "book.epub"
+            build_test_epub(epub_path)
+            common = dict(
+                epub_path=epub_path,
+                out_root=tmp / "output",
+                voice="marin",
+                speed=1.5,
+                audio_format="mp3",
+                tts_model="gpt-4o-mini-tts",
+                clean_model="gpt-5.4-mini",
+                instructions="Test instructions",
+                max_chars=3200,
+                cleanup_max_chars=12000,
+                skip_titles=set(),
+                use_clean_model=False,
+                clean_backend="local",
+                cleanup_workers=1,
+            )
+            full = prepare_outputs(
+                **common,
+                chapter_numbers=[],
+                chapter_matches=[],
+            )
+            sample = prepare_outputs(
+                **common,
+                chapter_numbers=[1],
+                chapter_matches=[],
+            )
+            self.assertNotEqual(full["base_dir"], sample["base_dir"])
+            self.assertIn("full-book", str(full["base_dir"]))
+            self.assertIn("chapter-one", str(sample["base_dir"]))
+
+    def test_list_chapters_does_not_require_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            epub_path = tmp / "book.epub"
+            build_test_epub(epub_path)
+            env = os.environ.copy()
+            env["PYTHONPATH"] = "src"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "epub_to_audiobook.cli",
+                    str(epub_path),
+                    "--list-chapters",
+                    "--secret-file",
+                    str(tmp / "missing.env"),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Chapter One", proc.stdout)
+            self.assertIn("Chapter Two", proc.stdout)
+
+    def test_tts_backend_defaults_to_batch_and_rush_switches_to_live(self) -> None:
+        self.assertEqual(resolve_tts_backend(None, False), "batch")
+        self.assertEqual(resolve_tts_backend(None, True), "live")
+        self.assertEqual(resolve_tts_backend("live", False), "live")
+        with self.assertRaises(SystemExit):
+            resolve_tts_backend("batch", True)
+
+    def test_render_settings_prefer_saved_metadata_until_overridden(self) -> None:
+        args = Namespace(
+            audio_format=None,
+            speed=None,
+            voice=None,
+            tts_model=None,
+            instructions=None,
+        )
+        audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
+            args,
+            render_metadata={
+                "audio_format": "flac",
+                "speed": 1.5,
+                "voice": "cedar",
+                "tts_model": "gpt-4o-mini-tts",
+            },
+        )
+        self.assertEqual(audio_format, "flac")
+        self.assertEqual(speed, 1.5)
+        self.assertEqual(voice, "cedar")
+        self.assertEqual(tts_model, "gpt-4o-mini-tts")
+        self.assertIn("1.5x output speed", instructions)
+
+        override_args = Namespace(
+            audio_format="mp3",
+            speed=1.0,
+            voice="marin",
+            tts_model="override-model",
+            instructions="Custom instructions",
+        )
+        override = resolve_runtime_settings(
+            override_args,
+            render_metadata={
+                "audio_format": "flac",
+                "speed": 1.5,
+                "voice": "cedar",
+                "tts_model": "gpt-4o-mini-tts",
+            },
+        )
+        self.assertEqual(override, ("mp3", 1.0, "marin", "override-model", "Custom instructions"))
+
+    def test_wait_rejects_rush_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            epub_path = tmp / "book.epub"
+            build_test_epub(epub_path)
+            env = os.environ.copy()
+            env["PYTHONPATH"] = "src"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "epub_to_audiobook.cli",
+                    str(epub_path),
+                    "--wait",
+                    "--rush",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--wait can only be used with batch TTS", proc.stderr)
+
+    def test_batch_request_generation_and_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            requests_path = tmp / "requests.jsonl"
+            map_path = tmp / "map.json"
+            jobs = [
+                {
+                    "input": "Hello world",
+                    "out": "01-chapter/001.mp3",
+                }
+            ]
+            total, request_map = make_batch_requests(
+                pending_jobs=jobs,
+                tts_model="gpt-4o-mini-tts",
+                voice="marin",
+                audio_format="mp3",
+                instructions="Read clearly",
+                requests_path=requests_path,
+                map_path=map_path,
+            )
+            self.assertEqual(total, 1)
+            line = json.loads(requests_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(line["url"], BATCH_ENDPOINT)
+            self.assertEqual(line["body"]["audio"]["voice"], "marin")
+            self.assertEqual(line["body"]["audio"]["format"], "mp3")
+            self.assertEqual(request_map["tts-00001"], "01-chapter/001.mp3")
+
+            output_path = tmp / "output.jsonl"
+            audio_bytes = b"fake-mp3"
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "custom_id": "tts-00001",
+                        "response": {
+                            "status_code": 200,
+                            "body": {
+                                "choices": [
+                                    {
+                                        "message": {
+                                            "audio": {
+                                                "data": base64.b64encode(audio_bytes).decode("utf-8")
+                                            }
+                                        }
+                                    }
+                                ]
+                            },
+                        },
+                        "error": None,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            completed, failed = materialize_batch_outputs(
+                parts_dir=tmp / "parts",
+                output_path=output_path,
+                map_path=map_path,
+                force=False,
+            )
+            self.assertEqual((completed, failed), (1, 0))
+            self.assertEqual((tmp / "parts" / "01-chapter" / "001.mp3").read_bytes(), audio_bytes)
+
+
+if __name__ == "__main__":
+    unittest.main()
