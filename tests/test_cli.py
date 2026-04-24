@@ -19,7 +19,9 @@ from epub_to_audiobook.cli import (
     local_cleanup,
     make_batch_requests,
     materialize_batch_outputs,
+    merge_all,
     prepare_outputs,
+    resolve_media_tool,
     resolve_runtime_settings,
     resolve_epub_paths,
     resolve_tts_backend,
@@ -333,6 +335,107 @@ class CliTests(unittest.TestCase):
             self.assertIn("START=1250", text)
             self.assertIn("END=3750", text)
             self.assertIn(f"title={escape_ffmetadata('Chapter = One')}", text)
+
+    def test_media_tool_prefers_path_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_tool = Path(tmpdir) / "ffmpeg"
+            fake_tool.write_text("", encoding="utf-8")
+            with patch("epub_to_audiobook.cli.shutil.which", return_value=str(fake_tool)):
+                self.assertEqual(resolve_media_tool("ffmpeg"), str(fake_tool))
+
+    def test_m4b_merge_embeds_chapter_titles_when_ffmpeg_available(self) -> None:
+        try:
+            ffmpeg = resolve_media_tool("ffmpeg")
+            ffprobe = resolve_media_tool("ffprobe")
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            parts_dir = tmp / "parts"
+            merge_dir = tmp / "merge"
+            parts_dir.mkdir()
+            merge_dir.mkdir()
+            chapter_outputs = []
+            manifest = []
+            for idx, title in enumerate(["Chapter One", "Chapter Two"], start=1):
+                part_path = parts_dir / f"{idx:03d}.mp3"
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"sine=frequency={400 + idx * 100}:duration=0.25",
+                        "-q:a",
+                        "9",
+                        "-acodec",
+                        "libmp3lame",
+                        str(part_path),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                concat_path = merge_dir / f"{idx:02d}.txt"
+                concat_path.write_text(f"file '{part_path.as_posix()}'\n", encoding="utf-8")
+                chapter_output = tmp / f"{idx:02d}.mp3"
+                chapter_outputs.append(chapter_output)
+                manifest.append(
+                    {
+                        "index": idx,
+                        "title": title,
+                        "chapter_output": chapter_output.as_posix(),
+                        "concat_list": concat_path.as_posix(),
+                    }
+                )
+
+            manifest_path = tmp / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            metadata_path = tmp / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "title": "Test Book",
+                        "selection_title": "Test Book",
+                        "creator": "Test Author",
+                        "publisher": "Test Publisher",
+                        "date": "2026",
+                        "language": "en",
+                        "identifier": "id",
+                        "description": "desc",
+                        "cover_path": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            book_concat_path = merge_dir / "book.txt"
+            book_concat_path.write_text(
+                "".join(f"file '{path.as_posix()}'\n" for path in chapter_outputs),
+                encoding="utf-8",
+            )
+            final_path = tmp / "book.m4b"
+            merge_all(manifest_path, metadata_path, book_concat_path, final_path, merge_workers=1)
+            probe = subprocess.check_output(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_chapters",
+                    "-show_entries",
+                    "format_tags=title,artist,media_type",
+                    "-of",
+                    "json",
+                    str(final_path),
+                ],
+                text=True,
+            )
+            data = json.loads(probe)
+            chapters = data.get("chapters", [])
+            self.assertEqual([chapter["tags"]["title"] for chapter in chapters], ["Chapter One", "Chapter Two"])
+            self.assertEqual(data.get("format", {}).get("tags", {}).get("title"), "Test Book")
+            self.assertEqual(data.get("format", {}).get("tags", {}).get("artist"), "Test Author")
 
 
 if __name__ == "__main__":

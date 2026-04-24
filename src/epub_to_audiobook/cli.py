@@ -784,10 +784,21 @@ def build_audio_metadata(
     return {key: value for key, value in tags.items() if value}
 
 
+def resolve_media_tool(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
+        candidate = Path(prefix) / name
+        if candidate.exists():
+            return str(candidate)
+    raise SystemExit(f"{name} not found. Install ffmpeg and ensure {name} is on PATH.")
+
+
 def ffprobe_duration(path: Path) -> float:
     result = subprocess.run(
         [
-            "ffprobe",
+            resolve_media_tool("ffprobe"),
             "-v",
             "error",
             "-show_entries",
@@ -1739,14 +1750,18 @@ def merge_audio(
     suffix = output_path.suffix.lower()
     if suffix not in {".mp3", ".flac", ".wav", ".m4b"}:
         raise SystemExit(f"Unsupported merged audio format: {output_path.suffix}")
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path)]
+    cmd = [resolve_media_tool("ffmpeg"), "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path)]
     chapter_metadata_index = None
     if chapter_metadata_path and chapter_metadata_path.exists():
         chapter_metadata_index = 1
         cmd.extend(["-f", "ffmetadata", "-i", str(chapter_metadata_path)])
     if cover_path and suffix in {".mp3", ".m4b"} and cover_path.exists():
         cmd.extend(["-i", str(cover_path)])
-    cmd.extend(["-map_metadata", "-1", "-map", "0:a"])
+    if chapter_metadata_index is not None:
+        cmd.extend(["-map_metadata", str(chapter_metadata_index)])
+    else:
+        cmd.extend(["-map_metadata", "-1"])
+    cmd.extend(["-map", "0:a"])
     if chapter_metadata_index is not None:
         cmd.extend(["-map_chapters", str(chapter_metadata_index)])
     if suffix == ".m4b":
