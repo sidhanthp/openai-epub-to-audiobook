@@ -11,9 +11,11 @@ import unittest
 import zipfile
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 from epub_to_audiobook.cli import (
     BATCH_ENDPOINT,
+    escape_ffmetadata,
     local_cleanup,
     make_batch_requests,
     materialize_batch_outputs,
@@ -21,6 +23,7 @@ from epub_to_audiobook.cli import (
     resolve_runtime_settings,
     resolve_epub_paths,
     resolve_tts_backend,
+    write_chapter_metadata_file,
 )
 
 
@@ -117,6 +120,7 @@ class CliTests(unittest.TestCase):
                 voice="marin",
                 speed=1.5,
                 audio_format="mp3",
+                final_format="m4b",
                 tts_model="gpt-4o-mini-tts",
                 clean_model="gpt-5.4-mini",
                 instructions="Test instructions",
@@ -140,6 +144,7 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(full["base_dir"], sample["base_dir"])
             self.assertIn("full-book", str(full["base_dir"]))
             self.assertIn("chapter-one", str(sample["base_dir"]))
+            self.assertEqual(Path(full["final_book_path"]).suffix, ".m4b")
 
     def test_list_chapters_does_not_require_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -178,21 +183,24 @@ class CliTests(unittest.TestCase):
     def test_render_settings_prefer_saved_metadata_until_overridden(self) -> None:
         args = Namespace(
             audio_format=None,
+            final_format=None,
             speed=None,
             voice=None,
             tts_model=None,
             instructions=None,
         )
-        audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
+        audio_format, final_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
             args,
             render_metadata={
                 "audio_format": "flac",
+                "final_format": "m4b",
                 "speed": 1.5,
                 "voice": "cedar",
                 "tts_model": "gpt-4o-mini-tts",
             },
         )
         self.assertEqual(audio_format, "flac")
+        self.assertEqual(final_format, "m4b")
         self.assertEqual(speed, 1.5)
         self.assertEqual(voice, "cedar")
         self.assertEqual(tts_model, "gpt-4o-mini-tts")
@@ -200,6 +208,7 @@ class CliTests(unittest.TestCase):
 
         override_args = Namespace(
             audio_format="mp3",
+            final_format="m4b",
             speed=1.0,
             voice="marin",
             tts_model="override-model",
@@ -214,7 +223,7 @@ class CliTests(unittest.TestCase):
                 "tts_model": "gpt-4o-mini-tts",
             },
         )
-        self.assertEqual(override, ("mp3", 1.0, "marin", "override-model", "Custom instructions"))
+        self.assertEqual(override, ("mp3", "m4b", 1.0, "marin", "override-model", "Custom instructions"))
 
     def test_wait_rejects_rush_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -302,6 +311,28 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual((completed, failed), (1, 0))
             self.assertEqual((tmp / "parts" / "01-chapter" / "001.mp3").read_bytes(), audio_bytes)
+
+    def test_chapter_metadata_uses_epub_titles_and_durations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            one = tmp / "one.mp3"
+            two = tmp / "two.mp3"
+            one.write_bytes(b"one")
+            two.write_bytes(b"two")
+            with patch("epub_to_audiobook.cli.ffprobe_duration", side_effect=[1.25, 2.5]):
+                metadata_path = write_chapter_metadata_file(
+                    chapter_outputs=[
+                        ("Chapter = One", one),
+                        ("Chapter Two", two),
+                    ],
+                    metadata_path=tmp / "chapters.ffmetadata",
+                )
+            text = metadata_path.read_text(encoding="utf-8")
+            self.assertIn("START=0", text)
+            self.assertIn("END=1250", text)
+            self.assertIn("START=1250", text)
+            self.assertIn("END=3750", text)
+            self.assertIn(f"title={escape_ffmetadata('Chapter = One')}", text)
 
 
 if __name__ == "__main__":

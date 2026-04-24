@@ -48,6 +48,7 @@ DEFAULT_CLEAN_MODEL = "gpt-5.4-mini"
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_TTS_VOICE = "marin"
 DEFAULT_AUDIO_FORMAT = "mp3"
+DEFAULT_FINAL_FORMAT = "m4b"
 DEFAULT_MAX_CHARS = 3200
 DEFAULT_CLEAN_BACKEND = "auto"
 DEFAULT_CLEANUP_WORKERS = 4
@@ -186,7 +187,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio-format",
         choices=["mp3", "flac", "wav"],
-        help=f"Output format for rendered chunk and final audio files (default: {DEFAULT_AUDIO_FORMAT})",
+        help=f"TTS chunk audio format (default: {DEFAULT_AUDIO_FORMAT})",
+    )
+    parser.add_argument(
+        "--final-format",
+        choices=["m4b", "mp3", "flac", "wav"],
+        help=f"Final audiobook format (default: {DEFAULT_FINAL_FORMAT})",
     )
     parser.add_argument(
         "--max-chars",
@@ -322,16 +328,22 @@ def resolve_tts_backend(tts_backend: str | None, rush: bool) -> str:
 def resolve_runtime_settings(
     args: argparse.Namespace,
     render_metadata: dict[str, object] | None = None,
-) -> tuple[str, float, str, str, str]:
+) -> tuple[str, str, float, str, str, str]:
     render_metadata = render_metadata or {}
     audio_format = str(
         args.audio_format or render_metadata.get("audio_format") or DEFAULT_AUDIO_FORMAT
+    )
+    final_format = str(
+        args.final_format
+        or render_metadata.get("final_format")
+        or render_metadata.get("audio_format")
+        or DEFAULT_FINAL_FORMAT
     )
     speed = float(args.speed if args.speed is not None else render_metadata.get("speed", 1.0))
     voice = str(args.voice or render_metadata.get("voice") or DEFAULT_TTS_VOICE)
     tts_model = str(args.tts_model or render_metadata.get("tts_model") or DEFAULT_TTS_MODEL)
     instructions = args.instructions or default_instructions(speed)
-    return audio_format, speed, voice, tts_model, instructions
+    return audio_format, final_format, speed, voice, tts_model, instructions
 
 
 def slugify(value: str) -> str:
@@ -770,6 +782,61 @@ def build_audio_metadata(
     if track_number is not None and track_total:
         tags["track"] = f"{track_number}/{track_total}"
     return {key: value for key, value in tags.items() if value}
+
+
+def ffprobe_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def escape_ffmetadata(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(";", "\\;")
+        .replace("#", "\\#")
+        .replace("\n", " ")
+    )
+
+
+def write_chapter_metadata_file(
+    *,
+    chapter_outputs: list[tuple[str, Path]],
+    metadata_path: Path,
+) -> Path:
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    start_ms = 0
+    lines = [";FFMETADATA1"]
+    for title, chapter_output in chapter_outputs:
+        duration_ms = max(1, round(ffprobe_duration(chapter_output) * 1000))
+        end_ms = start_ms + duration_ms
+        lines.extend(
+            [
+                "",
+                "[CHAPTER]",
+                "TIMEBASE=1/1000",
+                f"START={start_ms}",
+                f"END={end_ms}",
+                f"title={escape_ffmetadata(title)}",
+            ]
+        )
+        start_ms = end_ms
+    metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return metadata_path
 
 
 def batch_artifacts(base_dir: Path) -> BatchArtifacts:
@@ -1337,6 +1404,7 @@ def prepare_outputs(
     voice: str,
     speed: float,
     audio_format: str,
+    final_format: str,
     tts_model: str,
     clean_model: str,
     instructions: str,
@@ -1368,7 +1436,7 @@ def prepare_outputs(
     metadata_path = base_dir / "metadata.json"
     book_concat_path = merge_dir / "book.txt"
     final_basename = book_slug if selection_slug == "full-book" else f"{book_slug}-{selection_slug}"
-    final_book_path = base_dir / f"{final_basename}.{audio_format}"
+    final_book_path = base_dir / f"{final_basename}.{final_format}"
 
     for path in [raw_dir, clean_dir, parts_dir, merge_dir, assets_dir]:
         path.mkdir(parents=True, exist_ok=True)
@@ -1454,6 +1522,7 @@ def prepare_outputs(
         "description": truncate_plaintext(html_fragment_to_text(metadata.description), limit=500),
         "cover_path": cover_path.as_posix() if cover_path else None,
         "audio_format": audio_format,
+        "final_format": final_format,
         "voice": voice,
         "speed": speed,
         "tts_model": tts_model,
@@ -1664,15 +1733,26 @@ def merge_audio(
     *,
     audio_metadata: dict[str, str] | None = None,
     cover_path: Path | None = None,
+    chapter_metadata_path: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
-    if suffix not in {".mp3", ".flac", ".wav"}:
+    if suffix not in {".mp3", ".flac", ".wav", ".m4b"}:
         raise SystemExit(f"Unsupported merged audio format: {output_path.suffix}")
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path)]
-    if cover_path and suffix == ".mp3" and cover_path.exists():
+    chapter_metadata_index = None
+    if chapter_metadata_path and chapter_metadata_path.exists():
+        chapter_metadata_index = 1
+        cmd.extend(["-f", "ffmetadata", "-i", str(chapter_metadata_path)])
+    if cover_path and suffix in {".mp3", ".m4b"} and cover_path.exists():
         cmd.extend(["-i", str(cover_path)])
-    cmd.extend(["-map_metadata", "-1", "-map", "0:a", "-codec:a", "copy"])
+    cmd.extend(["-map_metadata", "-1", "-map", "0:a"])
+    if chapter_metadata_index is not None:
+        cmd.extend(["-map_chapters", str(chapter_metadata_index)])
+    if suffix == ".m4b":
+        cmd.extend(["-codec:a", "aac", "-b:a", "128k", "-movflags", "+faststart"])
+    else:
+        cmd.extend(["-codec:a", "copy"])
     if cover_path and suffix == ".mp3" and cover_path.exists():
         cmd.extend(
             [
@@ -1690,8 +1770,23 @@ def merge_audio(
                 "comment=Cover (front)",
             ]
         )
+    if cover_path and suffix == ".m4b" and cover_path.exists():
+        cover_index = 2 if chapter_metadata_index is not None else 1
+        cmd.extend(
+            [
+                "-map",
+                f"{cover_index}:v",
+                "-c:v",
+                "copy",
+                "-disposition:v:0",
+                "attached_pic",
+            ]
+        )
     if audio_metadata:
-        for key, value in audio_metadata.items():
+        metadata = dict(audio_metadata)
+        if suffix == ".m4b":
+            metadata.setdefault("media_type", "2")
+        for key, value in metadata.items():
             cmd.extend(["-metadata", f"{key}={value}"])
     cmd.append(str(output_path))
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1744,6 +1839,15 @@ def merge_all(
             futures = [executor.submit(merge_one, item) for item in manifest]
             for future in futures:
                 print(f"Merged chapter: {future.result()}")
+    chapter_metadata_path = None
+    if final_book_path.suffix.lower() == ".m4b":
+        chapter_metadata_path = write_chapter_metadata_file(
+            chapter_outputs=[
+                (str(item["title"]), Path(item["chapter_output"]))
+                for item in manifest
+            ],
+            metadata_path=book_concat_path.with_name("chapters.ffmetadata"),
+        )
     merge_audio(
         book_concat_path,
         final_book_path,
@@ -1753,6 +1857,7 @@ def merge_all(
             album=render_metadata.get("title", epub_metadata.title),
         ),
         cover_path=cover_path,
+        chapter_metadata_path=chapter_metadata_path,
     )
     print(f"Merged final audiobook: {final_book_path}")
 
@@ -1788,7 +1893,7 @@ def main() -> int:
                 f"Render dir must contain jobs.jsonl, manifest.json, and metadata.json: {render_dir}"
             )
         render_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
+        audio_format, final_format, speed, voice, tts_model, instructions = resolve_runtime_settings(
             args,
             render_metadata=render_metadata,
         )
@@ -1796,7 +1901,7 @@ def main() -> int:
         selection_slug = render_metadata.get("selection_slug", "selection")
         if selection_slug != "full-book":
             final_name = f"{final_name}-{selection_slug}"
-        final_book_path = render_dir / f"{final_name}.{audio_format}"
+        final_book_path = render_dir / f"{final_name}.{final_format}"
         load_api_key(secret_file)
         if tts_backend == "batch":
             run_tts_batch_api(
@@ -1856,13 +1961,14 @@ def main() -> int:
     if needs_api_key:
         load_api_key(secret_file)
 
-    audio_format, speed, voice, tts_model, instructions = resolve_runtime_settings(args)
+    audio_format, final_format, speed, voice, tts_model, instructions = resolve_runtime_settings(args)
     prepared = prepare_outputs(
         epub_path=epub_path,
         out_root=out_root,
         voice=voice,
         speed=speed,
         audio_format=audio_format,
+        final_format=final_format,
         tts_model=tts_model,
         clean_model=args.clean_model,
         instructions=instructions,

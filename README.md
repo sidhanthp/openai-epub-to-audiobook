@@ -5,7 +5,7 @@ Turn an `EPUB` into a single audiobook file with:
 - EPUB chapter parsing
 - optional text cleanup before speech
 - OpenAI TTS rendering with cheap-by-default batch mode
-- final merge with audiobook-friendly metadata and cover art
+- final `m4b` merge with audiobook-friendly metadata, cover art, and chapters
 
 This repo intentionally excludes any books, generated audio, or secrets.
 
@@ -16,6 +16,7 @@ This repo intentionally excludes any books, generated audio, or secrets.
 - Isolates one-chapter samples from full-book renders
 - Lists chapters without requiring API credentials
 - Supports resume/render-only mode from an existing prepared directory
+- Transfers EPUB title, author, publisher, date, language, identifier, description, cover art, and chapter titles when available
 
 ## Requirements
 
@@ -59,7 +60,8 @@ epub-to-audiobook /path/to/book.epub \
   --rush \
   --voice marin \
   --speed 1.5 \
-  --audio-format mp3
+  --audio-format mp3 \
+  --final-format m4b
 ```
 
 Submit a full book in default cheap batch mode:
@@ -69,6 +71,7 @@ epub-to-audiobook /path/to/book.epub \
   --voice marin \
   --speed 1.5 \
   --audio-format mp3 \
+  --final-format m4b \
   --cleanup-workers 4
 ```
 
@@ -79,6 +82,7 @@ epub-to-audiobook /path/to/book.epub \
   --voice marin \
   --speed 1.5 \
   --audio-format mp3 \
+  --final-format m4b \
   --cleanup-workers 4 \
   --wait
 ```
@@ -108,6 +112,8 @@ epub-to-audiobook \
 - `--rush`: switch to live TTS for faster interactive samples and retakes.
 - `--tts-backend`: advanced override if you want to force `live` or `batch` directly.
 
+`--audio-format` controls the OpenAI TTS chunk format. `--final-format` controls the final audiobook file. The default is MP3 chunks plus an `m4b` final because `m4b` is the most reliable single-file format for audiobook chapters in common players.
+
 Recommended workflow:
 
 - Samples and retakes: `--rush`
@@ -132,7 +138,20 @@ Inside it:
 - `jobs.jsonl`: prepared TTS jobs
 - `manifest.json`: chapter manifest
 - `metadata.json`: source and render metadata
-- `<final>.mp3|flac|wav`: merged audiobook
+- `<final>.m4b|mp3|flac|wav`: merged audiobook
+
+## Audiobook Metadata
+
+When the EPUB provides the fields, the final audiobook carries over:
+
+- title and selection title
+- author as artist, album artist, and composer
+- publisher, date/year, language, and identifier/ISBN
+- description/comment
+- cover image
+- chapter titles from the EPUB table of contents
+
+The default `m4b` final output also embeds a chapter table using the merged chapter durations, so audiobook players can show chapter navigation inside the single final file. MP3, FLAC, and WAV final files keep normal tags, but chapter navigation support is player-dependent and less reliable than `m4b`.
 
 ## Cleanup Backends
 
